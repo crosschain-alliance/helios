@@ -23,6 +23,7 @@ pub enum Network {
     GOERLI,
     SEPOLIA,
     HOLESKY,
+    LUKSO,
 }
 
 impl FromStr for Network {
@@ -34,6 +35,7 @@ impl FromStr for Network {
             "goerli" => Ok(Self::GOERLI),
             "sepolia" => Ok(Self::SEPOLIA),
             "holesky" => Ok(Self::HOLESKY),
+            "lukso" => Ok(Self::LUKSO),
             _ => Err(eyre::eyre!("network not recognized")),
         }
     }
@@ -46,6 +48,7 @@ impl Display for Network {
             Self::GOERLI => "goerli",
             Self::SEPOLIA => "sepolia",
             Self::HOLESKY => "holesky",
+            Self::LUKSO => "lukso",
         };
 
         f.write_str(str)
@@ -59,6 +62,7 @@ impl Network {
             Self::GOERLI => goerli(),
             Self::SEPOLIA => sepolia(),
             Self::HOLESKY => holesky(),
+            Self::LUKSO => lukso(),
         }
     }
 
@@ -68,6 +72,7 @@ impl Network {
             5 => Ok(Network::GOERLI),
             11155111 => Ok(Network::SEPOLIA),
             17000 => Ok(Network::HOLESKY),
+            42 => Ok(Network::LUKSO),
             _ => Err(eyre::eyre!("chain id not known")),
         }
     }
@@ -233,6 +238,47 @@ pub fn holesky() -> BaseConfig {
         max_checkpoint_age: 1_209_600, // 14 days
         #[cfg(not(target_arch = "wasm32"))]
         data_dir: Some(data_dir(Network::HOLESKY)),
+        ..std::default::Default::default()
+    }
+}
+
+pub fn lukso() -> BaseConfig {
+    BaseConfig {
+        default_checkpoint: b256!(
+            "359c1653e247f202beb957d684ecf3257629d3b15dbd83be76afbe287c470cf4"
+        ),
+        rpc_port: 8545,
+        consensus_rpc: Some("".to_string()),
+        chain: ChainConfig {
+            chain_id: 42,
+            genesis_time: 1684858800,
+            genesis_root: b256!("a27edd68cde5c396f499157945d062a010308ce5ed5719a6b1e12ad2a51b97e6"),
+        },
+        forks: Forks {
+            genesis: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("42000001"),
+            },
+            altair: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("42000002"),
+            },
+            bellatrix: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("42000003"),
+            },
+            capella: Fork {
+                epoch: 8100,
+                fork_version: fixed_bytes!("42000004"),
+            },
+            deneb: Fork {
+                epoch: 123075,
+                fork_version: fixed_bytes!("42000005"),
+            },
+        },
+        max_checkpoint_age: 1_209_600, // 14 days
+        #[cfg(not(target_arch = "wasm32"))]
+        data_dir: Some(data_dir(Network::LUKSO)),
         ..std::default::Default::default()
     }
 }
