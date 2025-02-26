@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
-
 use eyre::Result;
+use helios_core::fork_schedule::ForkSchedule;
 use reqwest::{IntoUrl, Url};
+use std::net::SocketAddr;
 
 use crate::{
     config::Network,
@@ -17,6 +17,7 @@ pub struct OpStackClientBuilder {
     consensus_rpc: Option<Url>,
     execution_rpc: Option<Url>,
     rpc_socket: Option<SocketAddr>,
+    verify_unsafe_singer: Option<bool>,
 }
 
 impl OpStackClientBuilder {
@@ -49,6 +50,11 @@ impl OpStackClientBuilder {
         self
     }
 
+    pub fn verify_unsafe_singer(mut self, value: bool) -> Self {
+        self.verify_unsafe_singer = Some(value);
+        self
+    }
+
     pub fn build(self) -> Result<OpStackClient> {
         let config = if let Some(config) = self.config {
             config
@@ -72,12 +78,19 @@ impl OpStackClientBuilder {
                 chain: NetworkConfig::from(network).chain,
                 load_external_fallback: None,
                 checkpoint: None,
+                verify_unsafe_signer: self.verify_unsafe_singer.unwrap_or_default(),
             }
         };
+
+        let fork_schedule = ForkSchedule {
+            prague_timestamp: u64::MAX,
+        };
+
         let consensus = ConsensusClient::new(&config);
         OpStackClient::new(
-            &config.execution_rpc.to_string(),
+            config.execution_rpc.as_ref(),
             consensus,
+            fork_schedule,
             #[cfg(not(target_arch = "wasm32"))]
             config.rpc_socket,
         )

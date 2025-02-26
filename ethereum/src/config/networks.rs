@@ -7,6 +7,7 @@ use alloy::primitives::{b256, fixed_bytes};
 #[cfg(not(target_arch = "wasm32"))]
 use dirs::home_dir;
 use eyre::Result;
+use helios_core::fork_schedule::ForkSchedule;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
@@ -19,11 +20,11 @@ use crate::config::types::ChainConfig;
     Debug, Clone, Copy, Serialize, Deserialize, EnumIter, Hash, Eq, PartialEq, PartialOrd, Ord,
 )]
 pub enum Network {
-    MAINNET,
-    GOERLI,
-    SEPOLIA,
-    HOLESKY,
-    LUKSO,
+    Mainnet,
+    Sepolia,
+    Holesky,
+    PectraDevnet,
+    Lukso,
 }
 
 impl FromStr for Network {
@@ -31,11 +32,11 @@ impl FromStr for Network {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "mainnet" => Ok(Self::MAINNET),
-            "goerli" => Ok(Self::GOERLI),
-            "sepolia" => Ok(Self::SEPOLIA),
-            "holesky" => Ok(Self::HOLESKY),
-            "lukso" => Ok(Self::LUKSO),
+            "mainnet" => Ok(Self::Mainnet),
+            "sepolia" => Ok(Self::Sepolia),
+            "holesky" => Ok(Self::Holesky),
+            "pectra-devnet" => Ok(Self::PectraDevnet),
+            "lukso" => Ok(Self::Lukso),
             _ => Err(eyre::eyre!("network not recognized")),
         }
     }
@@ -44,11 +45,11 @@ impl FromStr for Network {
 impl Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            Self::MAINNET => "mainnet",
-            Self::GOERLI => "goerli",
-            Self::SEPOLIA => "sepolia",
-            Self::HOLESKY => "holesky",
-            Self::LUKSO => "lukso",
+            Self::Mainnet => "mainnet",
+            Self::Sepolia => "sepolia",
+            Self::Holesky => "holesky",
+            Self::PectraDevnet => "pectra-devnet",
+            Self::Lukso => "lukso",
         };
 
         f.write_str(str)
@@ -58,21 +59,20 @@ impl Display for Network {
 impl Network {
     pub fn to_base_config(&self) -> BaseConfig {
         match self {
-            Self::MAINNET => mainnet(),
-            Self::GOERLI => goerli(),
-            Self::SEPOLIA => sepolia(),
-            Self::HOLESKY => holesky(),
-            Self::LUKSO => lukso(),
+            Self::Mainnet => mainnet(),
+            Self::Sepolia => sepolia(),
+            Self::Holesky => holesky(),
+            Self::PectraDevnet => pectra_devnet(),
+            Self::Lukso => lukso(),
         }
     }
 
     pub fn from_chain_id(id: u64) -> Result<Self> {
         match id {
-            1 => Ok(Network::MAINNET),
-            5 => Ok(Network::GOERLI),
-            11155111 => Ok(Network::SEPOLIA),
-            17000 => Ok(Network::HOLESKY),
-            42 => Ok(Network::LUKSO),
+            1 => Ok(Network::Mainnet),
+            11155111 => Ok(Network::Sepolia),
+            17000 => Ok(Network::Holesky),
+            42 => Ok(Network::Lukso),
             _ => Err(eyre::eyre!("chain id not known")),
         }
     }
@@ -81,7 +81,7 @@ impl Network {
 pub fn mainnet() -> BaseConfig {
     BaseConfig {
         default_checkpoint: b256!(
-            "0d5144fae3e0059e1372e5fc8fc28b042f1e2b9e698a007d42856ca6766d6ceb"
+            "2f5319c3db189044de938be99a76d12205290b1bfbb280ef7b0f60a40fbf81b8"
         ),
         rpc_port: 8545,
         consensus_rpc: Some("https://ethereum.operationsolarstorm.org".to_string()),
@@ -111,51 +111,17 @@ pub fn mainnet() -> BaseConfig {
                 epoch: 269568,
                 fork_version: fixed_bytes!("04000000"),
             },
+            electra: Fork {
+                epoch: u64::MAX,
+                fork_version: fixed_bytes!("05000000"),
+            },
+        },
+        execution_forks: ForkSchedule {
+            prague_timestamp: u64::MAX,
         },
         max_checkpoint_age: 1_209_600, // 14 days
         #[cfg(not(target_arch = "wasm32"))]
-        data_dir: Some(data_dir(Network::MAINNET)),
-        ..std::default::Default::default()
-    }
-}
-
-pub fn goerli() -> BaseConfig {
-    BaseConfig {
-        default_checkpoint: b256!(
-            "f6e9d5fdd7c406834e888961beab07b2443b64703c36acc1274ae1ce8bb48839"
-        ),
-        rpc_port: 8545,
-        consensus_rpc: None,
-        chain: ChainConfig {
-            chain_id: 5,
-            genesis_time: 1616508000,
-            genesis_root: b256!("043db0d9a83813551ee2f33450d23797757d430911a9320530ad8a0eabc43efb"),
-        },
-        forks: Forks {
-            genesis: Fork {
-                epoch: 0,
-                fork_version: fixed_bytes!("00001020"),
-            },
-            altair: Fork {
-                epoch: 36660,
-                fork_version: fixed_bytes!("01001020"),
-            },
-            bellatrix: Fork {
-                epoch: 112260,
-                fork_version: fixed_bytes!("02001020"),
-            },
-            capella: Fork {
-                epoch: 162304,
-                fork_version: fixed_bytes!("03001020"),
-            },
-            deneb: Fork {
-                epoch: 231680,
-                fork_version: fixed_bytes!("04001020"),
-            },
-        },
-        max_checkpoint_age: 1_209_600, // 14 days
-        #[cfg(not(target_arch = "wasm32"))]
-        data_dir: Some(data_dir(Network::GOERLI)),
+        data_dir: Some(data_dir(Network::Mainnet)),
         ..std::default::Default::default()
     }
 }
@@ -163,7 +129,7 @@ pub fn goerli() -> BaseConfig {
 pub fn sepolia() -> BaseConfig {
     BaseConfig {
         default_checkpoint: b256!(
-            "4135bf01bddcfadac11143ba911f1c7f0772fdd6b87742b0bc229887bbf62b48"
+            "d2450a31dbdec0be8bc09f2eeddc4b58fc77ed2df9158aa16cb1f6b63b90be3e"
         ),
         rpc_port: 8545,
         consensus_rpc: None,
@@ -193,10 +159,17 @@ pub fn sepolia() -> BaseConfig {
                 epoch: 132608,
                 fork_version: fixed_bytes!("90000073"),
             },
+            electra: Fork {
+                epoch: 222464,
+                fork_version: fixed_bytes!("90000074"),
+            },
+        },
+        execution_forks: ForkSchedule {
+            prague_timestamp: 1741159776,
         },
         max_checkpoint_age: 1_209_600, // 14 days
         #[cfg(not(target_arch = "wasm32"))]
-        data_dir: Some(data_dir(Network::SEPOLIA)),
+        data_dir: Some(data_dir(Network::Sepolia)),
         ..std::default::Default::default()
     }
 }
@@ -204,7 +177,7 @@ pub fn sepolia() -> BaseConfig {
 pub fn holesky() -> BaseConfig {
     BaseConfig {
         default_checkpoint: b256!(
-            "d8fad84478f4947c3d09cfefde36d09bb9e71217f650610a3eb730eba54cdf1f"
+            "8d7bf5aa9a46ef46ce2cec02e56c8a203d8157211d3599d61196972cf6def229"
         ),
         rpc_port: 8545,
         consensus_rpc: None,
@@ -234,10 +207,65 @@ pub fn holesky() -> BaseConfig {
                 epoch: 29696,
                 fork_version: fixed_bytes!("05017000"),
             },
+            electra: Fork {
+                epoch: 115968,
+                fork_version: fixed_bytes!("06017000"),
+            },
+        },
+        execution_forks: ForkSchedule {
+            prague_timestamp: 1740434112,
         },
         max_checkpoint_age: 1_209_600, // 14 days
         #[cfg(not(target_arch = "wasm32"))]
-        data_dir: Some(data_dir(Network::HOLESKY)),
+        data_dir: Some(data_dir(Network::Holesky)),
+        ..std::default::Default::default()
+    }
+}
+
+pub fn pectra_devnet() -> BaseConfig {
+    BaseConfig {
+        default_checkpoint: b256!(
+            "f52e8522f1abc34fa91f4a0c6560cce6f9d557cfec083f1bc325a74c6060df84"
+        ),
+        rpc_port: 8545,
+        consensus_rpc: None,
+        chain: ChainConfig {
+            chain_id: 7072151312,
+            genesis_time: 1738603860,
+            genesis_root: b256!("5c074f81fbc78dc7ba47460572a4286fffe989e9921abfd50791e01e4044d274"),
+        },
+        forks: Forks {
+            genesis: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("10585557"),
+            },
+            altair: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("20585557"),
+            },
+            bellatrix: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("30585557"),
+            },
+            capella: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("40585557"),
+            },
+            deneb: Fork {
+                epoch: 0,
+                fork_version: fixed_bytes!("50585557"),
+            },
+            electra: Fork {
+                epoch: 10,
+                fork_version: fixed_bytes!("60585557"),
+            },
+        },
+        execution_forks: ForkSchedule {
+            prague_timestamp: 1738607700,
+        },
+        max_checkpoint_age: 1_209_600, // 14 days
+        #[cfg(not(target_arch = "wasm32"))]
+        data_dir: Some(data_dir(Network::PectraDevnet)),
         ..std::default::Default::default()
     }
 }
@@ -245,7 +273,7 @@ pub fn holesky() -> BaseConfig {
 pub fn lukso() -> BaseConfig {
     BaseConfig {
         default_checkpoint: b256!(
-            "359c1653e247f202beb957d684ecf3257629d3b15dbd83be76afbe287c470cf4"
+            "8e2efe8abceed48b8811c3b0e60dfac3556ece144b3f1557066bb9c80ccad482"
         ),
         rpc_port: 8545,
         consensus_rpc: Some("".to_string()),
@@ -275,10 +303,17 @@ pub fn lukso() -> BaseConfig {
                 epoch: 123075,
                 fork_version: fixed_bytes!("42000005"),
             },
+            electra: Fork {
+                epoch: u64::MAX,
+                fork_version: fixed_bytes!("42000006"),
+            },
+        },
+        execution_forks: ForkSchedule {
+            prague_timestamp: u64::MAX,
         },
         max_checkpoint_age: 1_209_600, // 14 days
         #[cfg(not(target_arch = "wasm32"))]
-        data_dir: Some(data_dir(Network::LUKSO)),
+        data_dir: Some(data_dir(Network::Lukso)),
         ..std::default::Default::default()
     }
 }

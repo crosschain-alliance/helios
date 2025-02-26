@@ -2,7 +2,9 @@ use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::client::ClientBuilder;
-use alloy::rpc::types::{BlockId, EIP1186AccountProofResponse, FeeHistory, Filter, Log};
+use alloy::rpc::types::{
+    BlockId, EIP1186AccountProofResponse, FeeHistory, Filter, FilterChanges, Log,
+};
 use alloy::transports::http::Http;
 use alloy::transports::layers::{RetryBackoffLayer, RetryBackoffService};
 use async_trait::async_trait;
@@ -12,7 +14,7 @@ use revm::primitives::AccessList;
 
 use crate::errors::RpcError;
 use crate::network_spec::NetworkSpec;
-use crate::types::{Block, BlockTag};
+use crate::types::BlockTag;
 
 use super::ExecutionRpc;
 
@@ -125,9 +127,10 @@ impl<N: NetworkSpec> ExecutionRpc<N> for HttpRpc<N> {
             BlockTag::Number(num) => BlockNumberOrTag::Number(num),
         };
 
+        let block_id = BlockId::from(block);
         let receipts = self
             .provider
-            .get_block_receipts(block)
+            .get_block_receipts(block_id)
             .await
             .map_err(|e| RpcError::new("get_block_receipts", e))?;
 
@@ -150,10 +153,10 @@ impl<N: NetworkSpec> ExecutionRpc<N> for HttpRpc<N> {
             .map_err(|e| RpcError::new("get_logs", e))?)
     }
 
-    async fn get_filter_changes(&self, filter_id: U256) -> Result<Vec<Log>> {
+    async fn get_filter_changes(&self, filter_id: U256) -> Result<FilterChanges> {
         Ok(self
             .provider
-            .get_filter_changes(filter_id)
+            .get_filter_changes_dyn(filter_id)
             .await
             .map_err(|e| RpcError::new("get_filter_changes", e))?)
     }
@@ -193,7 +196,7 @@ impl<N: NetworkSpec> ExecutionRpc<N> for HttpRpc<N> {
     async fn new_pending_transaction_filter(&self) -> Result<U256> {
         Ok(self
             .provider
-            .new_pending_transactions_filter(true)
+            .new_pending_transactions_filter(false)
             .await
             .map_err(|e| RpcError::new("new_pending_transaction_filter", e))?)
     }
@@ -219,12 +222,9 @@ impl<N: NetworkSpec> ExecutionRpc<N> for HttpRpc<N> {
             .map_err(|e| RpcError::new("fee_history", e))?)
     }
 
-    async fn get_block(&self, hash: B256) -> Result<Block<N::TransactionResponse>> {
+    async fn get_block(&self, hash: B256) -> Result<N::BlockResponse> {
         self.provider
-            .raw_request::<_, Option<Block<N::TransactionResponse>>>(
-                "eth_getBlockByHash".into(),
-                (hash, true),
-            )
+            .raw_request::<_, Option<N::BlockResponse>>("eth_getBlockByHash".into(), (hash, true))
             .await?
             .ok_or(eyre!("block not found"))
     }

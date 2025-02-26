@@ -29,6 +29,10 @@ pub enum ExecutionError {
     BlockNotFound(BlockTag),
     #[error("receipts root mismatch for block: {0}")]
     BlockReceiptsRootMismatch(BlockTag),
+    #[error("filter not found: 0x{0:x}")]
+    FilterNotFound(U256),
+    #[error("log does not match filter")]
+    LogFilterMismatch(),
 }
 
 /// Errors that can occur during evm.rs calls

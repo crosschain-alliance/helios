@@ -1,6 +1,7 @@
 use alloy::{
     consensus::{
-        BlobTransactionSidecar, Receipt, ReceiptWithBloom, TxReceipt, TxType, TypedTransaction,
+        proofs::{calculate_transaction_root, calculate_withdrawals_root},
+        BlockHeader, Receipt, ReceiptWithBloom, TxReceipt, TxType, TypedTransaction,
     },
     network::{BuildResult, Network, NetworkWallet, TransactionBuilder, TransactionBuilderError},
     primitives::{Address, Bytes, ChainId, TxKind, U256},
@@ -8,7 +9,7 @@ use alloy::{
 };
 use revm::primitives::{BlobExcessGasAndPrice, BlockEnv, TxEnv};
 
-use helios_core::{network_spec::NetworkSpec, types::Block};
+use helios_core::{fork_schedule::ForkSchedule, network_spec::NetworkSpec};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ethereum;
@@ -25,7 +26,7 @@ impl NetworkSpec for Ethereum {
 
         let consensus_receipt = Receipt {
             cumulative_gas_used: receipt.cumulative_gas_used(),
-            status: *receipt.status_or_post_state(),
+            status: receipt.status_or_post_state(),
             logs,
         };
 
@@ -36,6 +37,31 @@ impl NetworkSpec for Ethereum {
             TxType::Legacy => encoded,
             _ => [vec![tx_type as u8], encoded].concat(),
         }
+    }
+
+    fn is_hash_valid(block: &Self::BlockResponse) -> bool {
+        if block.header.hash_slow() != block.header.hash {
+            return false;
+        }
+
+        if let Some(txs) = block.transactions.as_transactions() {
+            let txs_root = calculate_transaction_root(
+                &txs.iter().map(|t| t.clone().inner).collect::<Vec<_>>(),
+            );
+            if txs_root != block.header.transactions_root {
+                return false;
+            }
+        }
+
+        if let Some(withdrawals) = &block.withdrawals {
+            let withdrawals_root =
+                calculate_withdrawals_root(&withdrawals.iter().copied().collect::<Vec<_>>());
+            if Some(withdrawals_root) != block.header.withdrawals_root {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn receipt_contains(list: &[Self::ReceiptResponse], elem: &Self::ReceiptResponse) -> bool {
@@ -53,52 +79,55 @@ impl NetworkSpec for Ethereum {
     }
 
     fn tx_env(tx: &Self::TransactionRequest) -> TxEnv {
-        let mut tx_env = TxEnv::default();
-        tx_env.caller = tx.from.unwrap_or_default();
-        tx_env.gas_limit = <TransactionRequest as TransactionBuilder<Self>>::gas_limit(tx)
-            .map(|v| v as u64)
-            .unwrap_or(u64::MAX);
-        tx_env.gas_price = <TransactionRequest as TransactionBuilder<Self>>::gas_price(tx)
-            .map(U256::from)
-            .unwrap_or_default();
-        tx_env.transact_to = tx.to.unwrap_or_default();
-        tx_env.value = tx.value.unwrap_or_default();
-        tx_env.data = <TransactionRequest as TransactionBuilder<Self>>::input(tx)
-            .unwrap_or_default()
-            .clone();
-        tx_env.nonce = <TransactionRequest as TransactionBuilder<Self>>::nonce(tx);
-        tx_env.chain_id = <TransactionRequest as TransactionBuilder<Self>>::chain_id(tx);
-        tx_env.access_list = <TransactionRequest as TransactionBuilder<Self>>::access_list(tx)
-            .map(|v| v.to_vec())
-            .unwrap_or_default();
-        tx_env.gas_priority_fee =
-            <TransactionRequest as TransactionBuilder<Self>>::max_priority_fee_per_gas(tx)
-                .map(U256::from);
-        tx_env.max_fee_per_blob_gas =
-            <TransactionRequest as TransactionBuilder<Self>>::max_fee_per_gas(tx).map(U256::from);
-        tx_env.blob_hashes = tx
-            .blob_versioned_hashes
-            .as_ref()
-            .map(|v| v.to_vec())
-            .unwrap_or_default();
-
-        tx_env
+        TxEnv {
+            caller: tx.from.unwrap_or_default(),
+            gas_limit: <TransactionRequest as TransactionBuilder<Self>>::gas_limit(tx)
+                .unwrap_or(u64::MAX),
+            gas_price: <TransactionRequest as TransactionBuilder<Self>>::gas_price(tx)
+                .map(U256::from)
+                .unwrap_or_default(),
+            transact_to: tx.to.unwrap_or_default(),
+            value: tx.value.unwrap_or_default(),
+            data: <TransactionRequest as TransactionBuilder<Self>>::input(tx)
+                .unwrap_or_default()
+                .clone(),
+            nonce: <TransactionRequest as TransactionBuilder<Self>>::nonce(tx),
+            chain_id: <TransactionRequest as TransactionBuilder<Self>>::chain_id(tx),
+            access_list: <TransactionRequest as TransactionBuilder<Self>>::access_list(tx)
+                .map(|v| v.to_vec())
+                .unwrap_or_default(),
+            gas_priority_fee:
+                <TransactionRequest as TransactionBuilder<Self>>::max_priority_fee_per_gas(tx)
+                    .map(U256::from),
+            max_fee_per_blob_gas:
+                <TransactionRequest as TransactionBuilder<Self>>::max_fee_per_gas(tx)
+                    .map(U256::from),
+            blob_hashes: tx
+                .blob_versioned_hashes
+                .as_ref()
+                .map(|v| v.to_vec())
+                .unwrap_or_default(),
+            authorization_list: None,
+        }
     }
 
-    fn block_env(block: &Block<Self::TransactionResponse>) -> BlockEnv {
-        let mut block_env = BlockEnv::default();
-        block_env.number = block.number.to();
-        block_env.coinbase = block.miner;
-        block_env.timestamp = block.timestamp.to();
-        block_env.gas_limit = block.gas_limit.to();
-        block_env.basefee = block.base_fee_per_gas;
-        block_env.difficulty = block.difficulty;
-        block_env.prevrandao = Some(block.mix_hash);
-        block_env.blob_excess_gas_and_price = block
-            .excess_blob_gas
-            .map(|v| BlobExcessGasAndPrice::new(v.to()));
+    fn block_env(block: &Self::BlockResponse, fork_schedule: &ForkSchedule) -> BlockEnv {
+        let is_prague = block.header.timestamp >= fork_schedule.prague_timestamp;
+        let blob_excess_gas_and_price = block
+            .header
+            .excess_blob_gas()
+            .map(|v| BlobExcessGasAndPrice::new(v, is_prague));
 
-        block_env
+        BlockEnv {
+            number: U256::from(block.header.number()),
+            coinbase: block.header.beneficiary(),
+            timestamp: U256::from(block.header.timestamp()),
+            gas_limit: U256::from(block.header.gas_limit()),
+            basefee: U256::from(block.header.base_fee_per_gas().unwrap_or(0_u64)),
+            difficulty: block.header.difficulty(),
+            prevrandao: block.header.mix_hash(),
+            blob_excess_gas_and_price,
+        }
     }
 }
 
@@ -112,6 +141,7 @@ impl Network for Ethereum {
     type TransactionResponse = alloy::rpc::types::Transaction;
     type ReceiptResponse = alloy::rpc::types::TransactionReceipt;
     type HeaderResponse = alloy::rpc::types::Header;
+    type BlockResponse = alloy::rpc::types::Block<Self::TransactionResponse, Self::HeaderResponse>;
 }
 
 impl TransactionBuilder<Ethereum> for TransactionRequest {
@@ -191,19 +221,11 @@ impl TransactionBuilder<Ethereum> for TransactionRequest {
         self.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
     }
 
-    fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        self.max_fee_per_blob_gas
-    }
-
-    fn set_max_fee_per_blob_gas(&mut self, max_fee_per_blob_gas: u128) {
-        self.max_fee_per_blob_gas = Some(max_fee_per_blob_gas)
-    }
-
-    fn gas_limit(&self) -> Option<u128> {
+    fn gas_limit(&self) -> Option<u64> {
         self.gas
     }
 
-    fn set_gas_limit(&mut self, gas_limit: u128) {
+    fn set_gas_limit(&mut self, gas_limit: u64) {
         self.gas = Some(gas_limit);
     }
 
@@ -215,21 +237,13 @@ impl TransactionBuilder<Ethereum> for TransactionRequest {
         self.access_list = Some(access_list);
     }
 
-    fn blob_sidecar(&self) -> Option<&BlobTransactionSidecar> {
-        self.sidecar.as_ref()
-    }
-
-    fn set_blob_sidecar(&mut self, sidecar: BlobTransactionSidecar) {
-        self.sidecar = Some(sidecar);
-        self.populate_blob_hashes();
-    }
-
     fn complete_type(&self, ty: TxType) -> Result<(), Vec<&'static str>> {
         match ty {
             TxType::Legacy => self.complete_legacy(),
             TxType::Eip2930 => self.complete_2930(),
             TxType::Eip1559 => self.complete_1559(),
             TxType::Eip4844 => self.complete_4844(),
+            TxType::Eip7702 => self.complete_7702(),
         }
     }
 

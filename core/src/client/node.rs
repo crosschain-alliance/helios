@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use alloy::consensus::BlockHeader;
+use alloy::network::BlockResponse;
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::rpc::types::{Filter, Log, SyncInfo, SyncStatus};
+use alloy::rpc::types::{Filter, FilterChanges, Log, SyncInfo, SyncStatus};
 use eyre::{eyre, Result};
 
 use crate::consensus::Consensus;
@@ -10,30 +12,38 @@ use crate::execution::evm::Evm;
 use crate::execution::rpc::http_rpc::HttpRpc;
 use crate::execution::state::State;
 use crate::execution::ExecutionClient;
+use crate::fork_schedule::ForkSchedule;
 use crate::network_spec::NetworkSpec;
 use crate::time::{SystemTime, UNIX_EPOCH};
-use crate::types::{Block, BlockTag};
+use crate::types::BlockTag;
 
-pub struct Node<N: NetworkSpec, C: Consensus<N::TransactionResponse>> {
+pub struct Node<N: NetworkSpec, C: Consensus<N::BlockResponse>> {
     pub consensus: C,
     pub execution: Arc<ExecutionClient<N, HttpRpc<N>>>,
     pub history_size: usize,
+    fork_schedule: ForkSchedule,
 }
 
-impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
-    pub fn new(execution_rpc: &str, mut consensus: C) -> Result<Self, ClientError> {
-        let block_recv = consensus.block_recv().take().unwrap();
-        let finalized_block_recv = consensus.finalized_block_recv().take().unwrap();
+impl<N: NetworkSpec, C: Consensus<N::BlockResponse>> Node<N, C> {
+    pub fn new(
+        execution_rpc: &str,
+        mut consensus: C,
+        fork_schedule: ForkSchedule,
+    ) -> Result<Self, ClientError> {
+        let block_recv = consensus.block_recv().unwrap();
+        let finalized_block_recv = consensus.finalized_block_recv().unwrap();
 
         let state = State::new(block_recv, finalized_block_recv, 256, execution_rpc);
         let execution = Arc::new(
-            ExecutionClient::new(execution_rpc, state).map_err(ClientError::InternalError)?,
+            ExecutionClient::new(execution_rpc, state, fork_schedule)
+                .map_err(ClientError::InternalError)?,
         );
 
         Ok(Node {
             consensus,
             execution,
             history_size: 64,
+            fork_schedule,
         })
     }
 
@@ -44,14 +54,24 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
     ) -> Result<Bytes, ClientError> {
         self.check_blocktag_age(&block).await?;
 
-        let mut evm = Evm::new(self.execution.clone(), self.chain_id(), block);
+        let mut evm = Evm::new(
+            self.execution.clone(),
+            self.chain_id(),
+            self.fork_schedule,
+            block,
+        );
         evm.call(tx).await.map_err(ClientError::EvmError)
     }
 
     pub async fn estimate_gas(&self, tx: &N::TransactionRequest) -> Result<u64, ClientError> {
         self.check_head_age().await?;
 
-        let mut evm = Evm::new(self.execution.clone(), self.chain_id(), BlockTag::Latest);
+        let mut evm = Evm::new(
+            self.execution.clone(),
+            self.chain_id(),
+            self.fork_schedule,
+            BlockTag::Latest,
+        );
 
         evm.estimate_gas(tx).await.map_err(ClientError::EvmError)
     }
@@ -72,7 +92,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
 
     pub async fn get_block_transaction_count_by_hash(&self, hash: B256) -> Result<Option<u64>> {
         let block = self.execution.get_block_by_hash(hash, false).await;
-        Ok(block.map(|block| block.transactions.hashes().len() as u64))
+        Ok(block.map(|block| block.transactions().hashes().len() as u64))
     }
 
     pub async fn get_block_transaction_count_by_number(
@@ -80,7 +100,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
         tag: BlockTag,
     ) -> Result<Option<u64>> {
         let block = self.execution.get_block(tag, false).await;
-        Ok(block.map(|block| block.transactions.hashes().len() as u64))
+        Ok(block.map(|block| block.transactions().hashes().len() as u64))
     }
 
     pub async fn get_code(&self, address: Address, tag: BlockTag) -> Result<Bytes> {
@@ -93,21 +113,12 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
     pub async fn get_storage_at(
         &self,
         address: Address,
-        slot: B256,
+        slot: U256,
         tag: BlockTag,
-    ) -> Result<U256> {
-        self.check_head_age().await?;
+    ) -> Result<B256> {
+        self.check_blocktag_age(&tag).await?;
 
-        let account = self
-            .execution
-            .get_account(address, Some(&[slot]), tag)
-            .await?;
-
-        let value = account.slots.get(&slot);
-        match value {
-            Some(value) => Ok(*value),
-            None => Err(eyre!("slot not found")),
-        }
+        self.execution.get_storage_at(address, slot, tag).await
     }
 
     pub async fn send_raw_transaction(&self, bytes: &[u8]) -> Result<B256> {
@@ -166,7 +177,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
         format!("helios-{}", helios_version)
     }
 
-    pub async fn get_filter_changes(&self, filter_id: U256) -> Result<Vec<Log>> {
+    pub async fn get_filter_changes(&self, filter_id: U256) -> Result<FilterChanges> {
         self.execution.get_filter_changes(filter_id).await
     }
 
@@ -199,9 +210,9 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
             .get_block(BlockTag::Latest, false)
             .await
             .ok_or(eyre!(ClientError::BlockNotFound(BlockTag::Latest)))?;
-        let base_fee = block.base_fee_per_gas;
-        let tip = U256::from(10_u64.pow(9));
-        Ok(base_fee + tip)
+        let base_fee = block.header().base_fee_per_gas().unwrap_or(0_u64);
+        let tip = 10_u64.pow(9);
+        Ok(U256::from(base_fee + tip))
     }
 
     pub async fn blob_base_fee(&self, block: BlockTag) -> Result<U256> {
@@ -222,14 +233,14 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
             .get_block(BlockTag::Latest, false)
             .await
             .ok_or(eyre!(ClientError::BlockNotFound(BlockTag::Latest)))?;
-        Ok(block.number.to())
+        Ok(U256::from(block.header().number()))
     }
 
     pub async fn get_block_by_number(
         &self,
         tag: BlockTag,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         self.check_blocktag_age(&tag).await?;
 
         let block = self.execution.get_block(tag, full_tx).await;
@@ -240,7 +251,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
         &self,
         hash: B256,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         let block = self.execution.get_block_by_hash(hash, full_tx).await;
         Ok(block)
     }
@@ -274,7 +285,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
             .await
             .ok_or(eyre!(ClientError::BlockNotFound(BlockTag::Latest)))?;
 
-        Ok(block.miner)
+        Ok(block.header().beneficiary())
     }
 
     async fn check_head_age(&self) -> Result<(), ClientError> {
@@ -288,8 +299,8 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
             .get_block(BlockTag::Latest, false)
             .await
             .ok_or_else(|| ClientError::OutOfSync(timestamp))?
-            .timestamp
-            .to();
+            .header()
+            .timestamp();
 
         let delay = timestamp.checked_sub(block_timestamp).unwrap_or_default();
         if delay > 60 {

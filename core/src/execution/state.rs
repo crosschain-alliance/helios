@@ -3,7 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::{
+    consensus::BlockHeader,
+    network::{primitives::HeaderResponse, BlockResponse},
+    primitives::{Address, B256, U256},
+    rpc::types::{BlockTransactions, Filter},
+};
 use eyre::{eyre, Result};
 use tokio::{
     select,
@@ -12,7 +17,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::network_spec::NetworkSpec;
-use crate::types::{Block, BlockTag, Transactions};
+use crate::types::BlockTag;
 
 use super::rpc::ExecutionRpc;
 
@@ -23,8 +28,8 @@ pub struct State<N: NetworkSpec, R: ExecutionRpc<N>> {
 
 impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
     pub fn new(
-        mut block_recv: Receiver<Block<N::TransactionResponse>>,
-        mut finalized_block_recv: watch::Receiver<Option<Block<N::TransactionResponse>>>,
+        mut block_recv: Receiver<N::BlockResponse>,
+        mut finalized_block_recv: watch::Receiver<Option<N::BlockResponse>>,
         history_length: u64,
         rpc: &str,
     ) -> Self {
@@ -48,7 +53,7 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
                     _ = finalized_block_recv.changed() => {
                         let block = finalized_block_recv.borrow_and_update().clone();
                         if let Some(block) = block {
-                            inner_ref.write().await.push_finalized_block(block).await;
+                            inner_ref.write().await.push_finalized_block(block);
                         }
 
                     },
@@ -59,13 +64,13 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         Self { inner }
     }
 
-    pub async fn push_block(&self, block: Block<N::TransactionResponse>) {
+    pub async fn push_block(&self, block: N::BlockResponse) {
         self.inner.write().await.push_block(block).await;
     }
 
     // full block fetch
 
-    pub async fn get_block(&self, tag: BlockTag) -> Option<Block<N::TransactionResponse>> {
+    pub async fn get_block(&self, tag: BlockTag) -> Option<N::BlockResponse> {
         match tag {
             BlockTag::Latest => self
                 .inner
@@ -80,13 +85,30 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         }
     }
 
-    pub async fn get_block_by_hash(&self, hash: B256) -> Option<Block<N::TransactionResponse>> {
+    pub async fn get_block_by_hash(&self, hash: B256) -> Option<N::BlockResponse> {
         let inner = self.inner.read().await;
         inner
             .hashes
             .get(&hash)
             .and_then(|number| inner.blocks.get(number))
             .cloned()
+    }
+
+    pub async fn get_blocks_after(&self, tag: BlockTag) -> Vec<N::BlockResponse> {
+        let start_block = self.get_block(tag).await;
+        if start_block.is_none() {
+            return vec![];
+        }
+        let start_block_num = start_block.unwrap().header().number();
+        let blocks = self
+            .inner
+            .read()
+            .await
+            .blocks
+            .range((start_block_num + 1)..)
+            .map(|(_, v)| v.clone())
+            .collect();
+        blocks
     }
 
     // transaction fetch
@@ -100,9 +122,10 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
                 inner
                     .blocks
                     .get(&loc.block)
-                    .and_then(|block| match &block.transactions {
-                        Transactions::Full(txs) => txs.get(loc.index),
-                        Transactions::Hashes(_) => unreachable!(),
+                    .and_then(|block| match &block.transactions() {
+                        BlockTransactions::Full(txs) => txs.get(loc.index),
+                        BlockTransactions::Hashes(_) => unreachable!(),
+                        BlockTransactions::Uncle => unreachable!(),
                     })
             })
             .cloned()
@@ -118,9 +141,10 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
             .hashes
             .get(&block_hash)
             .and_then(|number| inner.blocks.get(number))
-            .and_then(|block| match &block.transactions {
-                Transactions::Full(txs) => txs.get(index as usize),
-                Transactions::Hashes(_) => unreachable!(),
+            .and_then(|block| match &block.transactions() {
+                BlockTransactions::Full(txs) => txs.get(index as usize),
+                BlockTransactions::Hashes(_) => unreachable!(),
+                BlockTransactions::Uncle => unreachable!(),
             })
             .cloned()
     }
@@ -131,30 +155,51 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         index: u64,
     ) -> Option<N::TransactionResponse> {
         let block = self.get_block(tag).await?;
-        match &block.transactions {
-            Transactions::Full(txs) => txs.get(index as usize).cloned(),
-            Transactions::Hashes(_) => unreachable!(),
+        match &block.transactions() {
+            BlockTransactions::Full(txs) => txs.get(index as usize).cloned(),
+            BlockTransactions::Hashes(_) => unreachable!(),
+            BlockTransactions::Uncle => unreachable!(),
         }
     }
 
     // block field fetch
 
     pub async fn get_state_root(&self, tag: BlockTag) -> Option<B256> {
-        self.get_block(tag).await.map(|block| block.state_root)
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().state_root())
     }
 
     pub async fn get_receipts_root(&self, tag: BlockTag) -> Option<B256> {
-        self.get_block(tag).await.map(|block| block.receipts_root)
-    }
-
-    pub async fn get_base_fee(&self, tag: BlockTag) -> Option<U256> {
         self.get_block(tag)
             .await
-            .map(|block| block.base_fee_per_gas)
+            .map(|block| block.header().receipts_root())
+    }
+
+    pub async fn get_base_fee(&self, tag: BlockTag) -> Option<Option<u64>> {
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().base_fee_per_gas())
     }
 
     pub async fn get_coinbase(&self, tag: BlockTag) -> Option<Address> {
-        self.get_block(tag).await.map(|block| block.miner)
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().beneficiary())
+    }
+
+    // filter
+
+    pub async fn push_filter(&self, id: U256, filter: FilterType) {
+        self.inner.write().await.filters.insert(id, filter);
+    }
+
+    pub async fn remove_filter(&self, id: &U256) -> bool {
+        self.inner.write().await.filters.remove(id).is_some()
+    }
+
+    pub async fn get_filter(&self, id: &U256) -> Option<FilterType> {
+        self.inner.read().await.filters.get(id).cloned()
     }
 
     // misc
@@ -171,10 +216,11 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
 }
 
 struct Inner<N: NetworkSpec, R: ExecutionRpc<N>> {
-    blocks: BTreeMap<u64, Block<N::TransactionResponse>>,
-    finalized_block: Option<Block<N::TransactionResponse>>,
+    blocks: BTreeMap<u64, N::BlockResponse>,
+    finalized_block: Option<N::BlockResponse>,
     hashes: HashMap<B256, u64>,
     txs: HashMap<B256, TransactionLocation>,
+    filters: HashMap<U256, FilterType>,
     history_length: u64,
     rpc: R,
 }
@@ -187,12 +233,13 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
             finalized_block: None,
             hashes: HashMap::default(),
             txs: HashMap::default(),
+            filters: HashMap::default(),
             rpc,
         }
     }
 
-    pub async fn push_block(&mut self, block: Block<N::TransactionResponse>) {
-        let block_number = block.number.to::<u64>();
+    pub async fn push_block(&mut self, block: N::BlockResponse) {
+        let block_number = block.header().number();
         if self.try_insert_tip(block) {
             let mut n = block_number;
 
@@ -212,7 +259,7 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
             let link_parent = self.blocks.get(&(n - 1));
 
             if let (Some(parent), Some(child)) = (link_parent, link_child) {
-                if child.parent_hash != parent.hash {
+                if child.header().parent_hash() != parent.header().hash() {
                     warn!("detected block reorganization");
                     self.prune_before(n);
                 }
@@ -222,28 +269,28 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
         }
     }
 
-    fn try_insert_tip(&mut self, block: Block<N::TransactionResponse>) -> bool {
+    fn try_insert_tip(&mut self, block: N::BlockResponse) -> bool {
         if let Some((num, _)) = self.blocks.last_key_value() {
-            if num > &block.number.to() {
+            if num > &block.header().number() {
                 return false;
             }
         }
 
-        self.hashes.insert(block.hash, block.number.to());
+        self.hashes
+            .insert(block.header().hash(), block.header().number());
         block
-            .transactions
+            .transactions()
             .hashes()
-            .iter()
             .enumerate()
             .for_each(|(i, tx)| {
                 let location = TransactionLocation {
-                    block: block.number.to(),
+                    block: block.header().number(),
                     index: i,
                 };
-                self.txs.insert(*tx, location);
+                self.txs.insert(tx, location);
             });
 
-        self.blocks.insert(block.number.to(), block);
+        self.blocks.insert(block.header().number(), block);
         true
     }
 
@@ -256,14 +303,10 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
     }
 
     fn prune_before(&mut self, n: u64) {
-        loop {
-            if let Some((oldest, _)) = self.blocks.first_key_value() {
-                let oldest = *oldest;
-                if oldest < n {
-                    self.blocks.remove(&oldest);
-                } else {
-                    break;
-                }
+        while let Some((oldest, _)) = self.blocks.first_key_value() {
+            let oldest = *oldest;
+            if oldest < n {
+                self.blocks.remove(&oldest);
             } else {
                 break;
             }
@@ -277,11 +320,14 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
 
         if let Some(block) = self.blocks.get(&n) {
             let prev = n - 1;
-            if self.blocks.get(&prev).is_none() {
-                let backfilled = self.rpc.get_block(block.parent_hash).await?;
-                if backfilled.is_hash_valid() && block.parent_hash == backfilled.hash {
-                    info!("backfilled: block={}", backfilled.number);
-                    self.blocks.insert(backfilled.number.to(), backfilled);
+            if !self.blocks.contains_key(&prev) {
+                let backfilled = self.rpc.get_block(block.header().parent_hash()).await?;
+
+                if N::is_hash_valid(&backfilled)
+                    && block.header().parent_hash() == backfilled.header().hash()
+                {
+                    info!("backfilled: block={}", backfilled.header().number());
+                    self.blocks.insert(backfilled.header().number(), backfilled);
                     Ok(true)
                 } else {
                     warn!("bad block backfill");
@@ -295,22 +341,21 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
         }
     }
 
-    pub async fn push_finalized_block(&mut self, block: Block<N::TransactionResponse>) {
-        if let Some(old_block) = self.blocks.get(&block.number.to()) {
-            if old_block.hash != block.hash {
+    pub fn push_finalized_block(&mut self, block: N::BlockResponse) {
+        if let Some(old_block) = self.blocks.get(&block.header().number()) {
+            if old_block.header().hash() != block.header().hash() {
                 self.blocks = BTreeMap::new();
             }
         }
 
-        self.finalized_block = Some(block.clone());
-        self.push_block(block).await;
+        self.finalized_block = Some(block);
     }
 
     fn remove_block(&mut self, number: u64) {
         if let Some(block) = self.blocks.remove(&number) {
-            self.hashes.remove(&block.hash);
-            block.transactions.hashes().iter().for_each(|tx| {
-                self.txs.remove(tx);
+            self.hashes.remove(&block.header().hash());
+            block.transactions().hashes().for_each(|tx| {
+                self.txs.remove(&tx);
             });
         }
     }
@@ -319,4 +364,13 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
 struct TransactionLocation {
     block: u64,
     index: usize,
+}
+
+#[derive(Clone)]
+pub enum FilterType {
+    // filter content
+    Logs(Box<Filter>),
+    // block number when the filter was created or last queried
+    NewBlock(u64),
+    PendingTransactions,
 }
