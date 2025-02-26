@@ -3,9 +3,11 @@ extern crate web_sys;
 
 use std::str::FromStr;
 
-use alloy::primitives::{Address, B256};
-use alloy::rpc::types::{Filter, TransactionRequest};
+use alloy::primitives::{Address, B256, U256};
+use alloy::rpc::types::Filter;
 use wasm_bindgen::prelude::*;
+
+use op_alloy_rpc_types::OpTransactionRequest;
 
 use helios_core::types::BlockTag;
 use helios_opstack::config::{Config, Network, NetworkConfig};
@@ -45,6 +47,7 @@ impl OpStackClient {
             rpc_socket: None,
             load_external_fallback: None,
             checkpoint: None,
+            verify_unsafe_signer: false,
         };
 
         let inner = map_err(OpStackClientBuilder::new().config(config).build())?;
@@ -173,8 +176,22 @@ impl OpStackClient {
     }
 
     #[wasm_bindgen]
+    pub async fn get_storage_at(
+        &self,
+        address: JsValue,
+        slot: JsValue,
+        block: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let address: Address = serde_wasm_bindgen::from_value(address)?;
+        let slot: U256 = serde_wasm_bindgen::from_value(slot)?;
+        let block: BlockTag = serde_wasm_bindgen::from_value(block)?;
+        let storage = map_err(self.inner.get_storage_at(address, slot, block).await)?;
+        Ok(serde_wasm_bindgen::to_value(&storage)?)
+    }
+
+    #[wasm_bindgen]
     pub async fn call(&self, opts: JsValue, block: JsValue) -> Result<String, JsError> {
-        let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
+        let opts: OpTransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         let block: BlockTag = serde_wasm_bindgen::from_value(block)?;
         let res = map_err(self.inner.call(&opts, block).await)?;
         Ok(format!("0x{}", hex::encode(res)))
@@ -182,7 +199,7 @@ impl OpStackClient {
 
     #[wasm_bindgen]
     pub async fn estimate_gas(&self, opts: JsValue) -> Result<u32, JsError> {
-        let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
+        let opts: OpTransactionRequest = serde_wasm_bindgen::from_value(opts)?;
         Ok(map_err(self.inner.estimate_gas(&opts).await)? as u32)
     }
 
@@ -224,6 +241,46 @@ impl OpStackClient {
         let filter: Filter = serde_wasm_bindgen::from_value(filter)?;
         let logs = map_err(self.inner.get_logs(&filter).await)?;
         Ok(serde_wasm_bindgen::to_value(&logs)?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn get_filter_changes(&self, filter_id: JsValue) -> Result<JsValue, JsError> {
+        let filter_id: U256 = serde_wasm_bindgen::from_value(filter_id)?;
+        let filter_changes = map_err(self.inner.get_filter_changes(filter_id).await)?;
+        Ok(serde_wasm_bindgen::to_value(&filter_changes)?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn get_filter_logs(&self, filter_id: JsValue) -> Result<JsValue, JsError> {
+        let filter_id: U256 = serde_wasm_bindgen::from_value(filter_id)?;
+        let logs = map_err(self.inner.get_filter_logs(filter_id).await)?;
+        Ok(serde_wasm_bindgen::to_value(&logs)?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn uninstall_filter(&self, filter_id: JsValue) -> Result<bool, JsError> {
+        let filter_id: U256 = serde_wasm_bindgen::from_value(filter_id)?;
+        let uninstalled = map_err(self.inner.uninstall_filter(filter_id).await)?;
+        Ok(uninstalled)
+    }
+
+    #[wasm_bindgen]
+    pub async fn new_filter(&self, filter: JsValue) -> Result<JsValue, JsError> {
+        let filter: Filter = serde_wasm_bindgen::from_value(filter)?;
+        let filter_id = map_err(self.inner.new_filter(&filter).await)?;
+        Ok(serde_wasm_bindgen::to_value(&filter_id)?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn new_block_filter(&self) -> Result<JsValue, JsError> {
+        let filter_id = map_err(self.inner.new_block_filter().await)?;
+        Ok(serde_wasm_bindgen::to_value(&filter_id)?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn new_pending_transaction_filter(&self) -> Result<JsValue, JsError> {
+        let filter_id = map_err(self.inner.new_pending_transaction_filter().await)?;
+        Ok(serde_wasm_bindgen::to_value(&filter_id)?)
     }
 
     #[wasm_bindgen]

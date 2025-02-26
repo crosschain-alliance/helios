@@ -1,6 +1,7 @@
 use std::env;
 
 use alloy::eips::BlockNumberOrTag;
+use alloy::network::primitives::BlockTransactionsKind;
 use alloy::primitives::address;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::client::ClientBuilder as AlloyClientBuilder;
@@ -25,7 +26,7 @@ async fn setup() -> (
     let port = rand::thread_rng().gen_range(0..=65535);
 
     let mut helios_client = EthereumClientBuilder::new()
-        .network(Network::MAINNET)
+        .network(Network::Mainnet)
         .execution_rpc(&execution_rpc)
         .consensus_rpc(&consensus_rpc)
         .load_external_fallback()
@@ -54,7 +55,7 @@ async fn get_transaction_by_hash() {
     let (_handle, helios_provider, provider) = setup().await;
 
     let block = helios_provider
-        .get_block_by_number(BlockNumberOrTag::Latest, false)
+        .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
         .await
         .unwrap()
         .unwrap();
@@ -99,7 +100,7 @@ async fn get_transaction_receipt() {
     let (_handle, helios_provider, provider) = setup().await;
 
     let block = helios_provider
-        .get_block_by_number(BlockNumberOrTag::Latest, false)
+        .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
         .await
         .unwrap()
         .unwrap();
@@ -125,12 +126,12 @@ async fn get_block_receipts() {
     let (_handle, helios_provider, provider) = setup().await;
 
     let block = helios_provider
-        .get_block_by_number(BlockNumberOrTag::Latest, false)
+        .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
         .await
         .unwrap()
         .unwrap();
 
-    let block_num = block.header.number.unwrap().into();
+    let block_num = block.header.number.into();
 
     let helios_receipts = helios_provider
         .get_block_receipts(block_num)

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::rpc::types::{Filter, Log, SyncStatus};
+use alloy::rpc::types::{Filter, FilterChanges, Log, SyncStatus};
 use eyre::Result;
 use tracing::{info, warn};
 
@@ -11,27 +11,29 @@ use crate::client::node::Node;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::client::rpc::Rpc;
 use crate::consensus::Consensus;
+use crate::fork_schedule::ForkSchedule;
 use crate::network_spec::NetworkSpec;
 use crate::time::interval;
-use crate::types::{Block, BlockTag};
+use crate::types::BlockTag;
 
 pub mod node;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rpc;
 
-pub struct Client<N: NetworkSpec, C: Consensus<N::TransactionResponse>> {
+pub struct Client<N: NetworkSpec, C: Consensus<N::BlockResponse>> {
     node: Arc<Node<N, C>>,
     #[cfg(not(target_arch = "wasm32"))]
     rpc: Option<Rpc<N, C>>,
 }
 
-impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
+impl<N: NetworkSpec, C: Consensus<N::BlockResponse>> Client<N, C> {
     pub fn new(
         execution_rpc: &str,
         consensus: C,
+        fork_schedule: ForkSchedule,
         #[cfg(not(target_arch = "wasm32"))] rpc_address: Option<SocketAddr>,
     ) -> Result<Self> {
-        let node = Node::new(execution_rpc, consensus)?;
+        let node = Node::new(execution_rpc, consensus, fork_schedule)?;
         let node = Arc::new(node);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -99,9 +101,9 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
     pub async fn get_storage_at(
         &self,
         address: Address,
-        slot: B256,
+        slot: U256,
         block: BlockTag,
-    ) -> Result<U256> {
+    ) -> Result<B256> {
         self.node.get_storage_at(address, slot, block).await
     }
 
@@ -131,7 +133,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         self.node.get_logs(filter).await
     }
 
-    pub async fn get_filter_changes(&self, filter_id: U256) -> Result<Vec<Log>> {
+    pub async fn get_filter_changes(&self, filter_id: U256) -> Result<FilterChanges> {
         self.node.get_filter_changes(filter_id).await
     }
 
@@ -179,7 +181,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         &self,
         block: BlockTag,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         self.node.get_block_by_number(block, full_tx).await
     }
 
@@ -187,7 +189,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         &self,
         hash: B256,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         self.node.get_block_by_hash(hash, full_tx).await
     }
 

@@ -2,17 +2,18 @@ use std::marker::PhantomData;
 use std::process;
 use std::sync::Arc;
 
-use alloy::consensus::{Transaction as TxTrait, TxEnvelope};
-use alloy::primitives::{b256, fixed_bytes, B256, U256, U64};
-use alloy::rlp::{encode, Decodable};
-use alloy::rpc::types::{Parity, Signature, Transaction};
+use alloy::consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
+use alloy::consensus::{Header as ConsensusHeader, Transaction as TxTrait, TxEnvelope};
+use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+use alloy::primitives::{b256, fixed_bytes, Bloom, BloomInput, B256, U256};
+use alloy::rlp::Decodable;
+use alloy::rpc::types::{Block, BlockTransactions, Header, Transaction};
 use chrono::Duration;
 use eyre::eyre;
 use eyre::Result;
 use futures::future::join_all;
 use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
-use triehash_ethereum::ordered_trie_root;
 
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
@@ -29,7 +30,6 @@ use helios_consensus_core::{
 };
 use helios_core::consensus::Consensus;
 use helios_core::time::{interval_at, Instant, SystemTime, UNIX_EPOCH};
-use helios_core::types::{Block, Transactions};
 
 use crate::config::checkpoints::CheckpointFallback;
 use crate::config::networks::Network;
@@ -60,7 +60,7 @@ pub struct Inner<S: ConsensusSpec, R: ConsensusRpc<S>> {
     phantom: PhantomData<S>,
 }
 
-impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Transaction>
+impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Block>
     for ConsensusClient<S, R, DB>
 {
     fn block_recv(&mut self) -> Option<Receiver<Block<Transaction>>> {
@@ -93,7 +93,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> ConsensusClient<S, R, D
         let (shutdown_send, shutdown_recv) = watch::channel(false);
 
         let config_clone = config.clone();
-        let rpc = rpc.to_string();
+        let rpc: String = rpc.to_string();
         let genesis_time = config.chain.genesis_time;
         let db = Arc::new(DB::new(&config)?);
         let initial_checkpoint = config
@@ -265,7 +265,6 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         config: Arc<Config>,
     ) -> Inner<S, R> {
         let rpc = R::new(rpc);
-
         Inner {
             rpc,
             store: LightClientStore::default(),
@@ -444,7 +443,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
             .await
             .map_err(|err| eyre!("could not fetch bootstrap: {}", err))?;
 
-        let is_valid = self.is_valid_checkpoint(bootstrap.header.beacon().slot);
+        let is_valid = self.is_valid_checkpoint(bootstrap.header().beacon().slot);
 
         if !is_valid {
             if self.config.strict_checkpoint_age {
@@ -507,7 +506,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
     fn log_finality_update(&self, update: &FinalityUpdate<S>) {
         let size = S::sync_commitee_size() as f32;
         let participation =
-            get_bits::<S>(&update.sync_aggregate.sync_committee_bits) as f32 / size * 100f32;
+            get_bits::<S>(&update.sync_aggregate().sync_committee_bits) as f32 / size * 100f32;
         let decimals = if participation == 100.0 { 1 } else { 2 };
         let age = self.age(self.store.finalized_header.beacon().slot);
 
@@ -526,7 +525,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
     fn log_optimistic_update(&self, update: &FinalityUpdate<S>) {
         let size = S::sync_commitee_size() as f32;
         let participation =
-            get_bits::<S>(&update.sync_aggregate.sync_committee_bits) as f32 / size * 100f32;
+            get_bits::<S>(&update.sync_aggregate().sync_committee_bits) as f32 / size * 100f32;
         let decimals = if participation == 100.0 { 1 } else { 2 };
         let age = self.age(self.store.optimistic_header.beacon().slot);
 
@@ -594,129 +593,64 @@ fn payload_to_block<S: ConsensusSpec>(value: ExecutionPayload<S>) -> Block<Trans
             let mut tx_bytes_slice = tx_bytes.as_slice();
             let tx_envelope = TxEnvelope::decode(&mut tx_bytes_slice).unwrap();
 
-            let mut tx = Transaction {
-                hash: *tx_envelope.tx_hash(),
-                nonce: tx_envelope.nonce(),
+            let base_fee = Some(value.base_fee_per_gas().to());
+
+            Transaction {
                 block_hash: Some(*value.block_hash()),
                 block_number: Some(*value.block_number()),
                 transaction_index: Some(i as u64),
-                to: tx_envelope.to().to().cloned(),
-                value: tx_envelope.value(),
-                gas_price: tx_envelope.gas_price(),
-                gas: tx_envelope.gas_limit(),
-                input: tx_envelope.input().to_vec().into(),
-                chain_id: tx_envelope.chain_id(),
-                transaction_type: Some(tx_envelope.tx_type().into()),
-                ..Default::default()
-            };
-
-            match tx_envelope {
-                TxEnvelope::Legacy(inner) => {
-                    tx.from = inner.recover_signer().unwrap();
-                    tx.signature = Some(Signature {
-                        r: inner.signature().r(),
-                        s: inner.signature().s(),
-                        v: U256::from(inner.signature().v().to_u64()),
-                        y_parity: None,
-                    });
-                }
-                TxEnvelope::Eip2930(inner) => {
-                    tx.from = inner.recover_signer().unwrap();
-                    tx.signature = Some(Signature {
-                        r: inner.signature().r(),
-                        s: inner.signature().s(),
-                        v: U256::from(inner.signature().v().to_u64()),
-                        y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                    });
-                    tx.access_list = Some(inner.tx().access_list.clone());
-                }
-                TxEnvelope::Eip1559(inner) => {
-                    tx.from = inner.recover_signer().unwrap();
-                    tx.signature = Some(Signature {
-                        r: inner.signature().r(),
-                        s: inner.signature().s(),
-                        v: U256::from(inner.signature().v().to_u64()),
-                        y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                    });
-
-                    let tx_inner = inner.tx();
-                    tx.access_list = Some(tx_inner.access_list.clone());
-                    tx.max_fee_per_gas = Some(tx_inner.max_fee_per_gas);
-                    tx.max_priority_fee_per_gas = Some(tx_inner.max_priority_fee_per_gas);
-
-                    tx.gas_price = Some(gas_price(
-                        tx_inner.max_fee_per_gas,
-                        tx_inner.max_priority_fee_per_gas,
-                        value.base_fee_per_gas().to(),
-                    ));
-                }
-                TxEnvelope::Eip4844(inner) => {
-                    tx.from = inner.recover_signer().unwrap();
-                    tx.signature = Some(Signature {
-                        r: inner.signature().r(),
-                        s: inner.signature().s(),
-                        v: U256::from(inner.signature().v().to_u64()),
-                        y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                    });
-
-                    let tx_inner = inner.tx().tx();
-                    tx.access_list = Some(tx_inner.access_list.clone());
-                    tx.max_fee_per_gas = Some(tx_inner.max_fee_per_gas);
-                    tx.max_priority_fee_per_gas = Some(tx_inner.max_priority_fee_per_gas);
-                    tx.max_fee_per_blob_gas = Some(tx_inner.max_fee_per_blob_gas);
-                    tx.gas_price = Some(tx_inner.max_fee_per_gas);
-                    tx.blob_versioned_hashes = Some(tx_inner.blob_versioned_hashes.clone());
-
-                    tx.gas_price = Some(gas_price(
-                        tx_inner.max_fee_per_gas,
-                        tx_inner.max_priority_fee_per_gas,
-                        value.base_fee_per_gas().to(),
-                    ));
-                }
-                _ => todo!(),
+                from: tx_envelope.recover_signer().unwrap(),
+                effective_gas_price: Some(tx_envelope.effective_gas_price(base_fee)),
+                inner: tx_envelope,
             }
-
-            tx
         })
-        .collect::<Vec<Transaction>>();
+        .collect::<Vec<_>>();
+    let tx_envelopes = txs.iter().map(|tx| tx.inner.clone()).collect::<Vec<_>>();
+    let txs_root = calculate_transaction_root(&tx_envelopes);
 
-    let raw_txs = value.transactions().iter().map(|tx| tx.inner.to_vec());
-    let txs_root = ordered_trie_root(raw_txs);
+    let withdrawals: Vec<Withdrawal> = value
+        .withdrawals()
+        .unwrap()
+        .into_iter()
+        .map(|w| w.clone().into())
+        .collect();
+    let withdrawals_root = calculate_withdrawals_root(&withdrawals);
 
-    let withdrawals = value.withdrawals().unwrap().iter().map(encode);
-    let withdrawals_root = ordered_trie_root(withdrawals);
+    let logs_bloom: Bloom = Bloom::from(BloomInput::Raw(&value.logs_bloom().clone().inner));
 
-    Block {
-        number: U64::from(*value.block_number()),
-        base_fee_per_gas: *value.base_fee_per_gas(),
-        difficulty: U256::ZERO,
-        extra_data: value.extra_data().inner.to_vec().into(),
-        gas_limit: U64::from(*value.gas_limit()),
-        gas_used: U64::from(*value.gas_used()),
-        hash: *value.block_hash(),
-        logs_bloom: value.logs_bloom().inner.to_vec().into(),
-        miner: *value.fee_recipient(),
+    let consensus_header = ConsensusHeader {
         parent_hash: *value.parent_hash(),
-        receipts_root: *value.receipts_root(),
+        ommers_hash: empty_uncle_hash,
+        beneficiary: *value.fee_recipient(),
         state_root: *value.state_root(),
-        timestamp: U64::from(*value.timestamp()),
-        total_difficulty: U64::ZERO,
-        transactions: Transactions::Full(txs),
+        transactions_root: txs_root,
+        receipts_root: *value.receipts_root(),
+        withdrawals_root: Some(withdrawals_root),
+        difficulty: U256::ZERO,
+        number: *value.block_number(),
+        gas_limit: *value.gas_limit(),
+        gas_used: *value.gas_used(),
+        timestamp: *value.timestamp(),
         mix_hash: *value.prev_randao(),
         nonce: empty_nonce,
-        sha3_uncles: empty_uncle_hash,
-        size: U64::ZERO,
-        transactions_root: B256::from_slice(txs_root.as_bytes()),
-        uncles: vec![],
-        blob_gas_used: value.blob_gas_used().map(|v| U64::from(*v)).ok(),
-        excess_blob_gas: value.excess_blob_gas().map(|v| U64::from(*v)).ok(),
-        withdrawals_root: B256::from_slice(withdrawals_root.as_bytes()),
-        parent_beacon_block_root: Some(*value.parent_hash()),
-    }
-}
+        base_fee_per_gas: Some(value.base_fee_per_gas().to::<u64>()),
+        blob_gas_used: value.blob_gas_used().cloned().ok(),
+        excess_blob_gas: value.excess_blob_gas().cloned().ok(),
+        parent_beacon_block_root: None,
+        extra_data: value.extra_data().inner.to_vec().into(),
+        requests_hash: None,
+        logs_bloom,
+    };
 
-fn gas_price(max_fee: u128, max_prio_fee: u128, base_fee: u128) -> u128 {
-    u128::min(max_fee, max_prio_fee + base_fee)
+    let header = Header {
+        hash: *value.block_hash(),
+        inner: consensus_header,
+        total_difficulty: Some(U256::ZERO),
+        size: Some(U256::ZERO),
+    };
+
+    Block::new(header, BlockTransactions::Full(txs))
+        .with_withdrawals(Some(Withdrawals::new(withdrawals)))
 }
 
 #[cfg(test)]
@@ -805,7 +739,7 @@ mod tests {
             .unwrap();
 
         let mut update = updates[0].clone();
-        update.next_sync_committee.pubkeys[0] = PublicKey::default();
+        update.next_sync_committee_mut().pubkeys[0] = PublicKey::default();
 
         let err = client.verify_update(&update).err().unwrap();
         assert_eq!(
@@ -832,7 +766,7 @@ mod tests {
 
         let mut next_update = updates[1].clone();
         // Set a different finalized header to test invalid finality proof
-        next_update.finalized_header = updates[0].finalized_header.clone();
+        *next_update.finalized_header_mut() = updates[0].finalized_header().clone();
 
         let err = client.verify_update(&next_update).err().unwrap();
         assert_eq!(
@@ -854,7 +788,7 @@ mod tests {
             .unwrap();
 
         let mut update = updates[0].clone();
-        update.sync_aggregate.sync_committee_signature = Signature::default();
+        update.sync_aggregate_mut().sync_committee_signature = Signature::default();
 
         let err = client.verify_update(&update).err().unwrap();
         assert_eq!(
@@ -887,7 +821,7 @@ mod tests {
             .await
             .unwrap();
         // Replace here to test invalid finality proof
-        update.finalized_header = updates[0].finalized_header.clone();
+        *update.finalized_header_mut() = updates[0].finalized_header().clone();
 
         let err = client.verify_finality_update(&update).err().unwrap();
         assert_eq!(
@@ -901,7 +835,7 @@ mod tests {
         let client = get_client(false, true).await;
 
         let mut update = client.rpc.get_finality_update().await.unwrap();
-        update.sync_aggregate.sync_committee_signature = Signature::default();
+        update.sync_aggregate_mut().sync_committee_signature = Signature::default();
 
         let err = client.verify_finality_update(&update).err().unwrap();
         assert_eq!(

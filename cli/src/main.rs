@@ -26,6 +26,7 @@ use helios_opstack::{config::Config as OpStackConfig, OpStackClient, OpStackClie
 use tracing::{error, info};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use tracing_subscriber::FmtSubscriber;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,18 +67,14 @@ fn enable_tracer() {
     tracing::subscriber::set_global_default(subscriber).expect("subscriber set failed");
 }
 
-async fn start_client<N: NetworkSpec, C: Consensus<N::TransactionResponse>>(
-    client: &mut Client<N, C>,
-) {
+async fn start_client<N: NetworkSpec, C: Consensus<N::BlockResponse>>(client: &mut Client<N, C>) {
     if let Err(err) = client.start().await {
         error!(target: "helios::runner", error = %err);
         exit(1);
     }
 }
 
-fn register_shutdown_handler<N: NetworkSpec, C: Consensus<N::TransactionResponse>>(
-    client: Client<N, C>,
-) {
+fn register_shutdown_handler<N: NetworkSpec, C: Consensus<N::BlockResponse>>(client: Client<N, C>) {
     let client = Arc::new(client);
     let shutdown_counter = Arc::new(Mutex::new(0));
 
@@ -137,10 +134,10 @@ struct EthereumArgs {
     rpc_port: Option<u16>,
     #[clap(short = 'w', long, env)]
     checkpoint: Option<B256>,
-    #[clap(short, long, env)]
-    execution_rpc: Option<String>,
-    #[clap(short, long, env)]
-    consensus_rpc: Option<String>,
+    #[clap(short, long, env, value_parser = parse_url)]
+    execution_rpc: Option<Url>,
+    #[clap(short, long, env, value_parser = parse_url)]
+    consensus_rpc: Option<Url>,
     #[clap(short, long, env)]
     data_dir: Option<String>,
     #[clap(short = 'f', long, env)]
@@ -195,10 +192,10 @@ struct OpStackArgs {
     rpc_bind_ip: Option<IpAddr>,
     #[clap(short = 'p', long, env, default_value = "8545")]
     rpc_port: Option<u16>,
-    #[clap(short, long, env)]
-    execution_rpc: Option<String>,
-    #[clap(short, long, env)]
-    consensus_rpc: Option<String>,
+    #[clap(short, long, env, value_parser = parse_url)]
+    execution_rpc: Option<Url>,
+    #[clap(short, long, env, value_parser = parse_url)]
+    consensus_rpc: Option<Url>,
     #[clap(
         short = 'w',
         long = "ethereum-checkpoint",
@@ -234,11 +231,11 @@ impl OpStackArgs {
         let mut user_dict = HashMap::new();
 
         if let Some(rpc) = &self.execution_rpc {
-            user_dict.insert("execution_rpc", Value::from(rpc.clone()));
+            user_dict.insert("execution_rpc", Value::from(rpc.to_string()));
         }
 
         if let Some(rpc) = &self.consensus_rpc {
-            user_dict.insert("consensus_rpc", Value::from(rpc.clone()));
+            user_dict.insert("consensus_rpc", Value::from(rpc.to_string()));
         }
 
         if self.rpc_bind_ip.is_some() && self.rpc_port.is_some() {
@@ -277,9 +274,9 @@ struct GnosisArgs {
     #[clap(short = 'w', long, env)]
     checkpoint: Option<B256>,
     #[clap(short, long, env)]
-    execution_rpc: Option<String>,
+    execution_rpc: Option<Url>,
     #[clap(short, long, env)]
-    consensus_rpc: Option<String>,
+    consensus_rpc: Option<Url>,
     #[clap(short, long, env)]
     data_dir: Option<String>,
     #[clap(short = 'f', long, env)]
@@ -330,4 +327,8 @@ fn true_or_none(b: bool) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn parse_url(s: &str) -> Result<Url, url::ParseError> {
+    Url::parse(s)
 }

@@ -1,32 +1,36 @@
-use alloy::consensus::Transaction as TxTrait;
-use alloy::primitives::{b256, fixed_bytes, keccak256, Address, B256, U256, U64};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use alloy::consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
+use alloy::consensus::{Header as ConsensusHeader, Transaction as TxTrait};
+use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+use alloy::primitives::{b256, fixed_bytes, Address, Bloom, BloomInput, B256, U256};
 use alloy::rlp::Decodable;
-use alloy::rpc::types::{EIP1186AccountProofResponse, Parity, Signature, Transaction};
-use alloy_rlp::encode;
+use alloy::rpc::types::{
+    Block, EIP1186AccountProofResponse, Header, Transaction as EthTransaction,
+};
 use eyre::{eyre, OptionExt, Result};
 use op_alloy_consensus::OpTxEnvelope;
-use std::str::FromStr;
-use std::time::Duration;
+use op_alloy_network::primitives::BlockTransactions;
+use op_alloy_rpc_types::Transaction;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{
     mpsc::{channel, Receiver},
     watch,
 };
-use triehash_ethereum::ordered_trie_root;
+use tracing::{error, info, warn};
 
 use helios_consensus_core::consensus_spec::MainnetConsensusSpec;
 use helios_core::consensus::Consensus;
+use helios_core::execution::proof::{verify_account_proof, verify_mpt_proof};
 use helios_core::time::{interval, SystemTime, UNIX_EPOCH};
-use helios_core::types::{Block, Transactions};
 use helios_ethereum::consensus::ConsensusClient as EthConsensusClient;
-use std::sync::{Arc, Mutex};
 
-use crate::{config::Config, types::ExecutionPayload, SequencerCommitment};
-
-use helios_core::execution::proof::{encode_account, verify_proof};
 use helios_ethereum::database::ConfigDB;
 use helios_ethereum::rpc::http_rpc::HttpRpc;
-use tracing::{error, info, warn};
+
+use crate::{config::Config, types::ExecutionPayload, SequencerCommitment};
 
 // Storage slot containing the unsafe signer address in all superchain system config contracts
 const UNSAFE_SIGNER_SLOT: &str =
@@ -41,7 +45,7 @@ pub struct ConsensusClient {
 impl ConsensusClient {
     pub fn new(config: &Config) -> Self {
         let (block_send, block_recv) = channel(256);
-        let (finalized_block_send, finalied_block_recv) = watch::channel(None);
+        let (finalized_block_send, finalized_block_recv) = watch::channel(None);
 
         let mut inner = Inner {
             server_url: config.consensus_rpc.to_string(),
@@ -52,7 +56,9 @@ impl ConsensusClient {
             finalized_block_send,
         };
 
-        verify_unsafe_signer(config.clone(), inner.unsafe_signer.clone());
+        if config.verify_unsafe_signer {
+            verify_unsafe_signer(config.clone(), inner.unsafe_signer.clone());
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         let run = tokio::spawn;
@@ -72,13 +78,13 @@ impl ConsensusClient {
 
         Self {
             block_recv: Some(block_recv),
-            finalized_block_recv: Some(finalied_block_recv),
+            finalized_block_recv: Some(finalized_block_recv),
             chain_id: config.chain.chain_id,
         }
     }
 }
 
-impl Consensus<Transaction> for ConsensusClient {
+impl Consensus<Block<Transaction>> for ConsensusClient {
     fn chain_id(&self) -> u64 {
         self.chain_id
     }
@@ -138,7 +144,7 @@ impl Inner {
                 let number = payload.block_number;
 
                 if let Ok(block) = payload_to_block(payload) {
-                    self.latest_block = Some(block.number.to());
+                    self.latest_block = Some(block.header.number);
                     _ = self.block_send.send(block).await;
 
                     tracing::info!(
@@ -164,76 +170,85 @@ fn verify_unsafe_signer(config: Config, signer: Arc<Mutex<Address>>) {
     let run = wasm_bindgen_futures::spawn_local;
 
     run(async move {
-        let mut eth_config = config.chain.eth_network.to_base_config();
-        eth_config.load_external_fallback = config.load_external_fallback.unwrap_or(false);
-        if let Some(checkpoint) = config.checkpoint {
-            eth_config.default_checkpoint = checkpoint;
-        }
-        let mut eth_consensus = EthConsensusClient::<MainnetConsensusSpec, HttpRpc, ConfigDB>::new(
-            &eth_config
-                .consensus_rpc
-                .clone()
-                .ok_or_else(|| eyre!("missing consensus rpc"))?,
-            Arc::new(eth_config.into()),
-        )?;
-        let block = eth_consensus
-            .block_recv()
-            .unwrap()
-            .recv()
-            .await
-            .ok_or_eyre("failed to receive block")?;
-        // Query proof from op consensus server
-        let req = format!("{}unsafe_signer_proof/{}", config.consensus_rpc, block.hash);
-        let proof = reqwest::get(req)
-            .await?
-            .json::<EIP1186AccountProofResponse>()
-            .await?;
+        let fut = async move {
+            let mut eth_config = config.chain.eth_network.to_base_config();
+            eth_config.load_external_fallback = config.load_external_fallback.unwrap_or(false);
 
-        // Verify unsafe signer
-        // with account proof
-        let account_path = keccak256(proof.address).to_vec();
-        let account_encoded = encode_account(&proof);
-        let is_valid = verify_proof(
-            &proof.account_proof,
-            block.state_root.as_slice(),
-            &account_path,
-            &account_encoded,
-        );
-        if !is_valid {
-            warn!(target: "helios::opstack", "account proof invalid");
-            return Err(eyre!("account proof invalid"));
-        }
-        // with storage proof
-        let storage_proof = proof.storage_proof[0].clone();
-        let key = storage_proof.key.0;
-        if key != B256::from_str(UNSAFE_SIGNER_SLOT)? {
-            warn!(target: "helios::opstack", "account proof invalid");
-            return Err(eyre!("account proof invalid"));
-        }
-        let key_hash = keccak256(key);
-        let value = encode(storage_proof.value);
-        let is_valid = verify_proof(
-            &storage_proof.proof,
-            proof.storage_hash.as_slice(),
-            key_hash.as_slice(),
-            &value,
-        );
-        if !is_valid {
-            warn!(target: "helios::opstack", "storage proof invalid");
-            return Err(eyre!("storage proof invalid"));
-        }
-        // Replace unsafe signer if different
-        let verified_signer = Address::from_slice(&storage_proof.value.to_be_bytes::<32>()[12..32]);
-        {
-            let mut curr_signer = signer.lock().map_err(|_| eyre!("failed to lock signer"))?;
-            if verified_signer != *curr_signer {
-                info!(target: "helios::opstack", "unsafe signer updated: {}", verified_signer);
-                *curr_signer = verified_signer;
+            if let Some(checkpoint) = config.checkpoint {
+                eth_config.default_checkpoint = checkpoint;
             }
-        }
-        // Shutdown eth consensus client
-        eth_consensus.shutdown()?;
-        Ok(())
+
+            let mut eth_consensus =
+                EthConsensusClient::<MainnetConsensusSpec, HttpRpc, ConfigDB>::new(
+                    &eth_config
+                        .consensus_rpc
+                        .clone()
+                        .ok_or_else(|| eyre!("missing consensus rpc"))?,
+                    Arc::new(eth_config.into()),
+                )?;
+
+            let block = eth_consensus
+                .block_recv()
+                .unwrap()
+                .recv()
+                .await
+                .ok_or_eyre("failed to receive block")?;
+
+            // Query proof from op consensus server
+            let req = format!(
+                "{}unsafe_signer_proof/{}",
+                config.consensus_rpc, block.header.hash
+            );
+            let proof = reqwest::get(req)
+                .await?
+                .json::<EIP1186AccountProofResponse>()
+                .await?;
+
+            // Verify unsafe signer
+            // with account proof
+            if verify_account_proof(&proof, block.header.state_root).is_err() {
+                warn!(target: "helios::opstack", "account proof invalid");
+                return Err(eyre!("account proof invalid"));
+            }
+
+            // with storage proof
+            let storage_proof = proof.storage_proof[0].clone();
+            let key = storage_proof.key.as_b256();
+            if key != B256::from_str(UNSAFE_SIGNER_SLOT)? {
+                warn!(target: "helios::opstack", "account proof invalid");
+                return Err(eyre!("account proof invalid"));
+            }
+
+            if verify_mpt_proof(
+                proof.storage_hash,
+                key,
+                storage_proof.value,
+                &storage_proof.proof,
+            )
+            .is_err()
+            {
+                warn!(target: "helios::opstack", "storage proof invalid");
+                return Err(eyre!("storage proof invalid"));
+            }
+
+            // Replace unsafe signer if different
+            let verified_signer =
+                Address::from_slice(&storage_proof.value.to_be_bytes::<32>()[12..32]);
+            {
+                let mut curr_signer = signer.lock().map_err(|_| eyre!("failed to lock signer"))?;
+                if verified_signer != *curr_signer {
+                    info!(target: "helios::opstack", "unsafe signer updated: {}", verified_signer);
+                    *curr_signer = verified_signer;
+                }
+            }
+
+            // Shutdown eth consensus client
+            eth_consensus.shutdown()?;
+
+            Ok(())
+        };
+
+        _ = fut.await;
     });
 }
 
@@ -249,177 +264,112 @@ fn payload_to_block(value: ExecutionPayload) -> Result<Block<Transaction>> {
         .map(|(i, tx_bytes)| {
             let tx_bytes = tx_bytes.to_vec();
             let mut tx_bytes_slice = tx_bytes.as_slice();
-            let tx_envelope = OpTxEnvelope::decode(&mut tx_bytes_slice)?;
-            let transaction_type = Some(tx_envelope.tx_type().into());
+            let tx_envelope = OpTxEnvelope::decode(&mut tx_bytes_slice).unwrap();
+
+            let base_fee = tx_envelope.effective_gas_price(Some(value.base_fee_per_gas.to()));
+
+            let mut inner_tx = EthTransaction {
+                inner: tx_envelope.clone(),
+                block_hash: Some(value.block_hash),
+                block_number: Some(value.block_number),
+                transaction_index: Some(i as u64),
+                effective_gas_price: Some(base_fee),
+                from: Address::ZERO,
+            };
 
             Ok(match tx_envelope {
                 OpTxEnvelope::Legacy(inner) => {
-                    let inner_tx = inner.tx();
+                    inner_tx.from = inner.recover_signer()?;
+
                     Transaction {
-                        hash: *inner.hash(),
-                        nonce: inner_tx.nonce,
-                        block_hash: Some(value.block_hash),
-                        block_number: Some(value.block_number),
-                        transaction_index: Some(i as u64),
-                        to: inner_tx.to.to().cloned(),
-                        value: inner_tx.value,
-                        gas_price: Some(inner_tx.gas_price),
-                        gas: inner_tx.gas_limit,
-                        input: inner_tx.input.to_vec().into(),
-                        chain_id: inner_tx.chain_id,
-                        transaction_type,
-                        from: inner.recover_signer()?,
-                        signature: Some(Signature {
-                            r: inner.signature().r(),
-                            s: inner.signature().s(),
-                            v: U256::from(inner.signature().v().to_u64()),
-                            y_parity: None,
-                        }),
-                        ..Default::default()
+                        inner: inner_tx,
+                        deposit_nonce: None,
+                        deposit_receipt_version: None,
                     }
                 }
                 OpTxEnvelope::Eip2930(inner) => {
-                    let inner_tx = inner.tx();
+                    inner_tx.from = inner.recover_signer()?;
+
                     Transaction {
-                        hash: *inner.hash(),
-                        nonce: inner_tx.nonce,
-                        block_hash: Some(value.block_hash),
-                        block_number: Some(value.block_number),
-                        transaction_index: Some(i as u64),
-                        to: inner_tx.to.to().cloned(),
-                        value: inner_tx.value,
-                        gas_price: Some(inner_tx.gas_price),
-                        gas: inner_tx.gas_limit,
-                        input: inner_tx.input.to_vec().into(),
-                        chain_id: Some(inner_tx.chain_id),
-                        transaction_type,
-                        from: inner.recover_signer()?,
-                        signature: Some(Signature {
-                            r: inner.signature().r(),
-                            s: inner.signature().s(),
-                            v: U256::from(inner.signature().v().to_u64()),
-                            y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                        }),
-                        access_list: Some(inner.tx().access_list.clone()),
-                        ..Default::default()
+                        inner: inner_tx,
+                        deposit_nonce: None,
+                        deposit_receipt_version: None,
                     }
                 }
                 OpTxEnvelope::Eip1559(inner) => {
-                    let inner_tx = inner.tx();
+                    inner_tx.from = inner.recover_signer()?;
+
                     Transaction {
-                        hash: *inner.hash(),
-                        nonce: inner_tx.nonce,
-                        block_hash: Some(value.block_hash),
-                        block_number: Some(value.block_number),
-                        transaction_index: Some(i as u64),
-                        to: inner_tx.to.to().cloned(),
-                        value: inner_tx.value,
-                        gas_price: inner_tx.gas_price(),
-                        gas: inner_tx.gas_limit,
-                        input: inner_tx.input.to_vec().into(),
-                        chain_id: Some(inner_tx.chain_id),
-                        transaction_type,
-                        from: inner.recover_signer()?,
-                        signature: Some(Signature {
-                            r: inner.signature().r(),
-                            s: inner.signature().s(),
-                            v: U256::from(inner.signature().v().to_u64()),
-                            y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                        }),
-                        access_list: Some(inner_tx.access_list.clone()),
-                        max_fee_per_gas: Some(inner_tx.max_fee_per_gas),
-                        max_priority_fee_per_gas: Some(inner_tx.max_priority_fee_per_gas),
-                        ..Default::default()
+                        inner: inner_tx,
+                        deposit_nonce: None,
+                        deposit_receipt_version: None,
                     }
                 }
-                OpTxEnvelope::Eip4844(inner) => {
-                    let inner_tx = inner.tx();
+                OpTxEnvelope::Eip7702(inner) => {
+                    inner_tx.from = inner.recover_signer()?;
+
                     Transaction {
-                        hash: *inner.hash(),
-                        nonce: inner_tx.nonce(),
-                        block_hash: Some(value.block_hash),
-                        block_number: Some(value.block_number),
-                        transaction_index: Some(i as u64),
-                        to: inner_tx.to().to().cloned(),
-                        value: inner_tx.value(),
-                        gas_price: inner_tx.gas_price(),
-                        gas: inner_tx.gas_limit(),
-                        input: inner_tx.input().to_vec().into(),
-                        chain_id: inner_tx.chain_id(),
-                        transaction_type,
-                        from: inner.recover_signer()?,
-                        signature: Some(Signature {
-                            r: inner.signature().r(),
-                            s: inner.signature().s(),
-                            v: U256::from(inner.signature().v().to_u64()),
-                            y_parity: Some(Parity(inner.signature().v().to_u64() == 1)),
-                        }),
-                        access_list: Some(inner_tx.tx().access_list.clone()),
-                        max_fee_per_gas: Some(inner_tx.tx().max_fee_per_gas),
-                        max_priority_fee_per_gas: Some(inner_tx.tx().max_priority_fee_per_gas),
-                        max_fee_per_blob_gas: Some(inner_tx.tx().max_fee_per_blob_gas),
-                        blob_versioned_hashes: Some(inner_tx.tx().blob_versioned_hashes.clone()),
-                        ..Default::default()
+                        inner: inner_tx,
+                        deposit_nonce: None,
+                        deposit_receipt_version: None,
                     }
                 }
                 OpTxEnvelope::Deposit(inner) => {
-                    let hash =
-                        keccak256([&[0x7Eu8], alloy::rlp::encode(&inner).as_slice()].concat());
+                    inner_tx.from = inner.inner().from;
+                    let deposit_nonce = Some(inner.inner().nonce());
 
-                    let tx = Transaction {
-                        hash,
-                        nonce: inner.nonce(),
-                        block_hash: Some(value.block_hash),
-                        block_number: Some(value.block_number),
-                        transaction_index: Some(i as u64),
-                        to: inner.to().to().cloned(),
-                        value: inner.value(),
-                        gas_price: inner.gas_price(),
-                        gas: inner.gas_limit(),
-                        input: inner.input().to_vec().into(),
-                        chain_id: inner.chain_id(),
-                        transaction_type,
-                        ..Default::default()
-                    };
-
-                    tx
+                    Transaction {
+                        inner: inner_tx,
+                        deposit_nonce,
+                        deposit_receipt_version: None,
+                    }
                 }
                 _ => unreachable!("new tx type"),
             })
         })
         .collect::<Result<Vec<Transaction>>>()?;
+    let tx_envelopes = txs
+        .iter()
+        .map(|tx| tx.inner.inner.clone())
+        .collect::<Vec<_>>();
+    let txs_root = calculate_transaction_root(&tx_envelopes);
 
-    let raw_txs = value.transactions.iter().map(|tx| tx.to_vec());
-    let txs_root = ordered_trie_root(raw_txs);
+    let withdrawals: Vec<Withdrawal> = value.withdrawals.into_iter().map(|w| w.into()).collect();
+    let withdrawals_root = calculate_withdrawals_root(&withdrawals);
 
-    let withdrawals = value.withdrawals.iter().map(|v| encode(v));
-    let withdrawals_root = ordered_trie_root(withdrawals);
+    let logs_bloom: Bloom = Bloom::from(BloomInput::Raw(&value.logs_bloom));
 
-    Ok(Block {
-        number: U64::from(value.block_number),
-        base_fee_per_gas: value.base_fee_per_gas,
-        difficulty: U256::ZERO,
-        extra_data: value.extra_data.to_vec().into(),
-        gas_limit: U64::from(value.gas_limit),
-        gas_used: U64::from(value.gas_used),
-        hash: value.block_hash,
-        logs_bloom: value.logs_bloom.to_vec().into(),
-        miner: value.fee_recipient,
+    let consensus_header = ConsensusHeader {
         parent_hash: value.parent_hash,
-        receipts_root: value.receipts_root,
+        ommers_hash: empty_uncle_hash,
+        beneficiary: Address::from(*value.fee_recipient),
         state_root: value.state_root,
-        timestamp: U64::from(value.timestamp),
-        total_difficulty: U64::ZERO,
-        transactions: Transactions::Full(txs),
+        transactions_root: txs_root,
+        receipts_root: value.receipts_root,
+        withdrawals_root: Some(withdrawals_root),
+        difficulty: U256::ZERO,
+        number: value.block_number,
+        gas_limit: value.gas_limit,
+        gas_used: value.gas_used,
+        timestamp: value.timestamp,
         mix_hash: value.prev_randao,
         nonce: empty_nonce,
-        sha3_uncles: empty_uncle_hash,
-        size: U64::ZERO,
-        transactions_root: B256::from_slice(txs_root.as_bytes()),
-        withdrawals_root: B256::from_slice(withdrawals_root.as_bytes()),
-        uncles: vec![],
-        blob_gas_used: Some(U64::from(value.blob_gas_used)),
-        excess_blob_gas: Some(U64::from(value.excess_blob_gas)),
+        base_fee_per_gas: Some(value.base_fee_per_gas.to::<u64>()),
+        blob_gas_used: Some(value.blob_gas_used),
+        excess_blob_gas: Some(value.excess_blob_gas),
         parent_beacon_block_root: None,
-    })
+        extra_data: value.extra_data.to_vec().into(),
+        requests_hash: None,
+        logs_bloom,
+    };
+
+    let header = Header {
+        hash: value.block_hash,
+        inner: consensus_header,
+        total_difficulty: Some(U256::ZERO),
+        size: Some(U256::ZERO),
+    };
+
+    Ok(Block::new(header, BlockTransactions::Full(txs))
+        .with_withdrawals(Some(Withdrawals::new(withdrawals))))
 }

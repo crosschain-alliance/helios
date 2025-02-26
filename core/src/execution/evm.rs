@@ -1,38 +1,51 @@
 use std::{borrow::BorrowMut, collections::HashMap, sync::Arc};
 
-use alloy::network::TransactionBuilder;
+use alloy::{
+    consensus::BlockHeader,
+    network::{primitives::HeaderResponse, BlockResponse, TransactionBuilder},
+};
 use eyre::{Report, Result};
 use futures::future::join_all;
 use revm::{
     primitives::{
-        address, AccessListItem, AccountInfo, Address, Bytecode, Bytes, Env, ExecutionResult,
-        ResultAndState, B256, U256,
+        address, AccessListItem, AccountInfo, Address, Bytecode, Bytes, CfgEnv, Env,
+        ExecutionResult, ResultAndState, B256, U256,
     },
     Database, Evm as Revm,
 };
 use tracing::trace;
 
-use crate::execution::{
-    constants::PARALLEL_QUERY_BATCH_SIZE,
-    errors::{EvmError, ExecutionError},
-    rpc::ExecutionRpc,
-    ExecutionClient,
-};
 use crate::network_spec::NetworkSpec;
 use crate::types::BlockTag;
+use crate::{
+    execution::{
+        constants::PARALLEL_QUERY_BATCH_SIZE,
+        errors::{EvmError, ExecutionError},
+        rpc::ExecutionRpc,
+        ExecutionClient,
+    },
+    fork_schedule::ForkSchedule,
+};
 
 pub struct Evm<N: NetworkSpec, R: ExecutionRpc<N>> {
     execution: Arc<ExecutionClient<N, R>>,
     chain_id: u64,
     tag: BlockTag,
+    fork_schedule: ForkSchedule,
 }
 
 impl<N: NetworkSpec, R: ExecutionRpc<N>> Evm<N, R> {
-    pub fn new(execution: Arc<ExecutionClient<N, R>>, chain_id: u64, tag: BlockTag) -> Self {
+    pub fn new(
+        execution: Arc<ExecutionClient<N, R>>,
+        chain_id: u64,
+        fork_schedule: ForkSchedule,
+        tag: BlockTag,
+    ) -> Self {
         Evm {
             execution,
             chain_id,
             tag,
+            fork_schedule,
         }
     }
 
@@ -88,23 +101,24 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Evm<N, R> {
     }
 
     async fn get_env(&self, tx: &N::TransactionRequest, tag: BlockTag) -> Env {
-        let mut env = Env::default();
-        env.tx = N::tx_env(tx);
-
         let block = self
             .execution
             .get_block(tag, false)
             .await
             .ok_or(ExecutionError::BlockNotFound(tag))
             .unwrap();
-        env.block = N::block_env(&block);
 
-        env.cfg.chain_id = self.chain_id;
-        env.cfg.disable_block_gas_limit = true;
-        env.cfg.disable_eip3607 = true;
-        env.cfg.disable_base_fee = true;
+        let mut cfg = CfgEnv::default();
+        cfg.chain_id = self.chain_id;
+        cfg.disable_block_gas_limit = true;
+        cfg.disable_eip3607 = true;
+        cfg.disable_base_fee = true;
 
-        env
+        Env {
+            tx: N::tx_env(tx),
+            block: N::block_env(&block, &self.fork_schedule),
+            cfg,
+        }
     }
 }
 
@@ -184,7 +198,7 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> EvmState<N, R> {
                         .await
                         .ok_or(ExecutionError::BlockNotFound(tag))?;
 
-                    self.block_hash.insert(*number, block.hash);
+                    self.block_hash.insert(*number, block.header().hash());
                 }
             }
         }
@@ -248,7 +262,8 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> EvmState<N, R> {
             .get_block(self.block, false)
             .await
             .ok_or(ExecutionError::BlockNotFound(self.block))?
-            .miner;
+            .header()
+            .beneficiary();
         let producer_access_entry = AccessListItem {
             address: coinbase,
             storage_keys: Vec::default(),
