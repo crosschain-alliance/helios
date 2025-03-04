@@ -1,0 +1,11 @@
+gnosis:
+  - endpoint: https://checkpoint.gnosischain.com/
+    name: beaconcha.in
+    state: true
+    verification: true
+    contacts:
+      - name: "@beaconcha_in"
+        link: https://twitter.com/beaconcha_in
+    health:
+      - result: true
+        date: 2025-03-04T15:47:45Z
