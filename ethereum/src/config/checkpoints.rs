@@ -12,7 +12,7 @@ use serde::{
 use crate::config::networks;
 
 /// The location where the list of checkpoint services are stored.
-pub const CHECKPOINT_SYNC_SERVICES_LIST: &str = "https://raw.githubusercontent.com/ethpandaops/crosschain-alliance/helios/tree/feat/gnosis-backup/checkpoint.yaml";
+pub const CHECKPOINT_SYNC_SERVICES_LIST: &str = "https://raw.githubusercontent.com/crosschain-alliance/helios/tree/feat/gnosis-backup/checkpoint.yaml";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawSlotResponse {
